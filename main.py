@@ -10,6 +10,7 @@ structured 4xx responses with a distinguishable ``reason``.
 from __future__ import annotations
 
 import os
+import re
 import uuid
 
 from fastapi import FastAPI, Request, Response
@@ -23,6 +24,17 @@ from header_compression import (
 )
 
 CONNECTION_ID_HEADER = "x-connection-id"
+
+#: Routes that address a connection explicitly in the path.
+_CONNECTION_PATH = re.compile(r"^/connections/([^/]+)")
+
+
+def _resolve_connection_id(request: Request) -> str:
+    """Connection id comes from the path, then the header, else is minted."""
+    match = _CONNECTION_PATH.match(request.url.path)
+    if match:
+        return match.group(1)
+    return request.headers.get(CONNECTION_ID_HEADER) or uuid.uuid4().hex
 
 
 def _config_from_env() -> CompressionConfig:
@@ -39,9 +51,10 @@ registry = ConnectionRegistry(_config_from_env())
 
 @app.middleware("http")
 async def compression_context_middleware(request: Request, call_next):
-    connection_id = request.headers.get(CONNECTION_ID_HEADER) or uuid.uuid4().hex
+    connection_id = _resolve_connection_id(request)
     request.state.connection_id = connection_id
-    request.state.compression = registry.get_or_create(connection_id)
+    # attach only if it already exists; endpoints create lazily on first use
+    request.state.compression = registry.get(connection_id)
     response: Response = await call_next(request)
     response.headers[CONNECTION_ID_HEADER] = connection_id
     return response
@@ -74,7 +87,7 @@ def list_connections():
 
 @app.get("/connections/{connection_id}/state")
 def connection_state(connection_id: str):
-    return registry.require(connection_id).state_snapshot()
+    return registry.get_or_create(connection_id).state_snapshot()
 
 
 class EncoderStreamBatch(BaseModel):
@@ -84,7 +97,7 @@ class EncoderStreamBatch(BaseModel):
 
 @app.post("/connections/{connection_id}/encoder-stream")
 def feed_encoder_stream(connection_id: str, batch: EncoderStreamBatch):
-    context = registry.require(connection_id)
+    context = registry.get_or_create(connection_id)
     unblocked = context.feed_encoder_stream(batch.seq, bytes.fromhex(batch.data))
     return {
         "unblocked": [
@@ -103,7 +116,7 @@ class HeaderBlockSubmission(BaseModel):
 def decode_header_block(
     connection_id: str, stream_id: int, submission: HeaderBlockSubmission
 ):
-    context = registry.require(connection_id)
+    context = registry.get_or_create(connection_id)
     headers = context.decode_headers(stream_id, bytes.fromhex(submission.block))
     if headers is None:
         return {"status": "blocked", "stream_id": stream_id}
@@ -122,7 +135,7 @@ class EncodeRequest(BaseModel):
 
 @app.post("/connections/{connection_id}/encode")
 def encode_headers(connection_id: str, request: EncodeRequest):
-    context = registry.require(connection_id)
+    context = registry.get_or_create(connection_id)
     block = context.encode_headers(request.stream_id, request.headers)
     batches = []
     while (batch := context.next_encoder_batch()) is not None:
@@ -133,7 +146,7 @@ def encode_headers(connection_id: str, request: EncodeRequest):
 
 @app.post("/connections/{connection_id}/reset")
 def reset_connection(connection_id: str):
-    registry.reset(connection_id)
+    registry.get_or_create(connection_id).reset()
     return {"status": "reset", "connection_id": connection_id}
 
 
