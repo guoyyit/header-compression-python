@@ -155,11 +155,14 @@ class DecoderEndpoint:
         while offset < len(block):
             line, offset = wire.decode_field_line(block, offset)
             headers.append(self._resolve_locked(line))
-        self._decoded[block_seq] = headers
-        self._decoded.move_to_end(block_seq)
-        while len(self._decoded) > self._decoded_cache_limit:
-            self._decoded.popitem(last=False)
-        self._pending += wire.encode_header_ack(block_seq)
+        if ric > 0:
+            # Only blocks that consumed dynamic-table entries are tracked
+            # and acknowledged; static-only blocks need no acknowledgement.
+            self._decoded[block_seq] = headers
+            self._decoded.move_to_end(block_seq)
+            while len(self._decoded) > self._decoded_cache_limit:
+                self._decoded.popitem(last=False)
+            self._pending += wire.encode_header_ack(block_seq)
         return list(headers)
 
     def _resolve_locked(self, line: wire.FieldLine) -> tuple[str, str]:
