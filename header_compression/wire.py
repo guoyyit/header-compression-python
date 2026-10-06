@@ -3,7 +3,12 @@
 Header block layout::
 
     <required insert count: 8-bit prefix int>
+    <block sequence number: 8-bit prefix int>
     <field line>*
+
+The block sequence number is connection-global and monotonic; the decoder
+echoes it in the header block acknowledgement so the encoder can match
+acks to blocks even when blocked streams decode out of order.
 
 Field line first-byte patterns::
 
@@ -22,7 +27,7 @@ Encoder-stream instruction first-byte patterns::
 
 Decoder-stream instruction first-byte patterns::
 
-    1xxx xxxx  header block acknowledgement (7-bit prefix stream id)
+    1xxx xxxx  header block acknowledgement (7-bit prefix block seq)
     01xx xxxx  insert count increment       (6-bit prefix delta)
 
 All multi-byte items are length-prefixed, so truncation is always
@@ -161,12 +166,12 @@ class DecoderInstruction:
     """kind: "header_ack" | "insert_count_increment"."""
 
     kind: str
-    stream_id: int | None = None
+    block_seq: int | None = None
     delta: int | None = None
 
 
-def encode_header_ack(stream_id: int) -> bytes:
-    return encode_integer(stream_id, 7, 0x80)
+def encode_header_ack(block_seq: int) -> bytes:
+    return encode_integer(block_seq, 7, 0x80)
 
 
 def encode_insert_count_increment(delta: int) -> bytes:
@@ -178,8 +183,8 @@ def decode_decoder_instruction(
 ) -> tuple[DecoderInstruction, int]:
     first = _require(data, offset, "decoder instruction")
     if first & 0x80:
-        stream_id, offset = decode_integer(data, offset, 7)
-        return DecoderInstruction("header_ack", stream_id=stream_id), offset
+        block_seq, offset = decode_integer(data, offset, 7)
+        return DecoderInstruction("header_ack", block_seq=block_seq), offset
     if first & 0x40:
         delta, offset = decode_integer(data, offset, 6)
         return DecoderInstruction("insert_count_increment", delta=delta), offset
@@ -189,10 +194,12 @@ def decode_decoder_instruction(
 
 
 # ------------------------------------------------------------ block prefix
-def encode_block_prefix(required_insert_count: int) -> bytes:
-    return encode_integer(required_insert_count, 8)
+def encode_block_prefix(required_insert_count: int, block_seq: int) -> bytes:
+    return encode_integer(required_insert_count, 8) + encode_integer(block_seq, 8)
 
 
-def decode_block_prefix(data: bytes, offset: int) -> tuple[int, int]:
-    """Returns ``(required_insert_count, new_offset)``."""
-    return decode_integer(data, offset, 8)
+def decode_block_prefix(data: bytes, offset: int) -> tuple[int, int, int]:
+    """Returns ``(required_insert_count, block_seq, new_offset)``."""
+    required_insert_count, offset = decode_integer(data, offset, 8)
+    block_seq, offset = decode_integer(data, offset, 8)
+    return required_insert_count, block_seq, offset
