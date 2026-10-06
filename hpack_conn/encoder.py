@@ -8,6 +8,12 @@ Representation formats (RFC 7541 section 6):
 
 Index space: static table occupies 1..N_static, the dynamic table follows
 at N_static+1.. with N_static+1 naming the NEWEST dynamic entry.
+
+After each :meth:`encode`, :attr:`required_insertions` reports the highest
+insertion generation this block references from EARLIER blocks; entries
+the block inserts itself are replayed by the decoder as it decodes and
+therefore do not count. This lets independent streams proceed without
+waiting on unrelated insertions.
 """
 
 from __future__ import annotations
@@ -27,6 +33,12 @@ class Encoder:
 
     Deterministic: identical (header sequence, configuration) always
     produces identical byte sequences.
+
+    ``strict_limits`` selects the policy for entries that cannot be
+    indexed because they exceed the table capacity / memory ceiling:
+    ``False`` (default) emits them without indexing (RFC 7541 style);
+    ``True`` rejects the encode with a distinguishable
+    :class:`~hpack_conn.errors.CapacityError` reason instead.
     """
 
     def __init__(
@@ -34,15 +46,34 @@ class Encoder:
         table: DynamicTable,
         static_table: StaticTable | None = None,
         indexing: bool = True,
+        strict_limits: bool = False,
     ) -> None:
         self._table = table
         self._static = static_table or StaticTable()
         self._indexing = indexing
+        self._strict_limits = strict_limits
         self._pending_size_updates: list[bytes] = []
+        self._required_insertions = 0
+        self._ref_floor = 0
+        self._uses_dynamic = False
 
     @property
     def table(self) -> DynamicTable:
         return self._table
+
+    @property
+    def required_insertions(self) -> int:
+        """Highest earlier-block insertion generation the last encoded
+        block depends on (0 = no dependency)."""
+        return self._required_insertions
+
+    @property
+    def last_block_uses_dynamic(self) -> bool:
+        """Whether the last encoded block touches the dynamic table
+        (size update, insertion, or dynamic reference). Such blocks must
+        be applied by the peer in encode order; blocks that do not touch
+        the table may be decoded in any order."""
+        return self._uses_dynamic
 
     def set_capacity(self, capacity: int) -> bytes:
         """Apply a negotiated capacity change.
@@ -59,9 +90,14 @@ class Encoder:
     def encode(self, headers: list[tuple[str, str]]) -> bytes:
         """Encode a header list into one header block."""
         out = bytearray()
+        self._uses_dynamic = bool(self._pending_size_updates)
         for update in self._pending_size_updates:
             out += update
         self._pending_size_updates.clear()
+        # Generations up to this point belong to earlier blocks; anything
+        # newer is inserted by this block itself and self-satisfied.
+        self._ref_floor = self._table.insertion_count
+        self._required_insertions = 0
         for name, value in headers:
             out += self._encode_field(name, value)
         return bytes(out)
@@ -77,23 +113,35 @@ class Encoder:
         if dyn_index is not None:
             entry = self._table.get(dyn_index)
             if entry.value == value:
+                self._track_reference(dyn_index)
+                self._uses_dynamic = True
                 return encode_integer(self._combined(dyn_index), 7, _FLAG_INDEXED)
 
         # No exact match: emit a literal. Use the best available name
         # index (dynamic first, then static) to keep the block small.
         name_index = 0
         if dyn_index is not None:
+            # A name reference into the dynamic table is a dependency too.
+            self._track_reference(dyn_index)
+            self._uses_dynamic = True
             name_index = self._combined(dyn_index)
         elif static_index is not None:
             name_index = static_index
 
         if self._indexing and HeaderField(name, value).size <= self._table.capacity:
             self._table.insert(name, value)
+            self._uses_dynamic = True
             return (
                 encode_integer(name_index, 6, _FLAG_INCREMENTAL)
                 + (b"" if name_index else encode_string(name))
                 + encode_string(value)
             )
+        if self._indexing and self._strict_limits:
+            # The entry cannot be indexed; surface the distinguishable
+            # rejection reason from the table instead of silently
+            # degrading. The table validates before mutating, so state
+            # is untouched by the failure.
+            self._table.insert(name, value)
         return (
             encode_integer(name_index, 4, 0x00)
             + (b"" if name_index else encode_string(name))
@@ -103,6 +151,13 @@ class Encoder:
     def _combined(self, dyn_index: int) -> int:
         """Map a 1-based dynamic index into the combined index space."""
         return len(self._static) + dyn_index
+
+    def _track_reference(self, dyn_index: int) -> None:
+        """Record a dependency on the entry at ``dyn_index`` if it was
+        inserted by an earlier block (self-inserted entries excluded)."""
+        generation = self._table.insertion_count - dyn_index + 1
+        if generation <= self._ref_floor:
+            self._required_insertions = max(self._required_insertions, generation)
 
     def split_combined(self, index: int) -> tuple[str, int]:
         """Inverse of :meth:`_combined`; exposed for tests/symmetry."""
